@@ -20,7 +20,7 @@ from typing import Any
 from curl_cffi import requests
 
 from csmatch.models import Match, MatchDetail, Score, Team
-from csmatch.sources.base import MatchSource, SourceError
+from csmatch.sources.base import MatchSource, SourceError, curl_lock
 
 
 API = "https://api.bo3.gg/api/v1"
@@ -131,8 +131,10 @@ class BO3Source(MatchSource):
         self._page_limit = page_limit
         self._upcoming_hours = upcoming_hours
 
-    # curl_cffi blocking calls are run in a thread so the TUI's event loop
-    # stays responsive.
+    # curl_cffi blocking calls are run in a thread so the TUI's event
+    # loop stays responsive, and held under the shared curl_lock so
+    # they don't race with HLTV-source calls and trip a BoringSSL state
+    # error.
     async def _fetch_json(self, url: str) -> Any:
         def _get() -> Any:
             r = requests.get(url, headers=HEADERS, impersonate="safari17_0", timeout=15)
@@ -143,7 +145,8 @@ class BO3Source(MatchSource):
             except Exception as e:
                 raise SourceError(f"bo3 invalid JSON for {url}: {e}") from e
 
-        return await asyncio.to_thread(_get)
+        async with curl_lock:
+            return await asyncio.to_thread(_get)
 
     async def list_live(self) -> list[Match]:
         live_url = (

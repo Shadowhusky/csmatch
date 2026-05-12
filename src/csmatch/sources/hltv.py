@@ -21,7 +21,7 @@ from curl_cffi import requests
 from selectolax.parser import HTMLParser, Node
 
 from csmatch.models import Match, MatchDetail, Player, Score, Team
-from csmatch.sources.base import MatchSource, SourceError
+from csmatch.sources.base import MatchSource, SourceError, curl_lock
 
 
 BASE = "https://www.hltv.org"
@@ -209,7 +209,11 @@ class HLTVSource(MatchSource):
                 raise SourceError(f"hltv {r.status_code} for {url}")
             return r.text
 
-        return await asyncio.to_thread(_do)
+        # Serialise against bo3.gg calls — curl_cffi's BoringSSL backend
+        # surfaces "invalid library (0)" when two threaded curl handles
+        # are negotiating TLS at the same time.
+        async with curl_lock:
+            return await asyncio.to_thread(_do)
 
     async def list_live(self) -> list[Match]:
         # HLTV's /matches HTML leaves map name + scores as empty
