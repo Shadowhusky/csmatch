@@ -1,0 +1,32 @@
+[project]
+name = "csmatch"
+version = "0.1.0"
+description = "Live CS2 pro-match terminal viewer"
+authors = [{ name = "shadowhusky" }]
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.85",
+    "curl_cffi>=0.7",
+    "selectolax>=0.3.21",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "click>=8.1",
+    "python-socketio>=5.16.1",
+    "websockets>=16.0",
+    "aiohttp>=3.13.5",
+    "playwright>=1.59.0",
+    "playwright-stealth>=2.0.3",
+]
+
+[project.scripts]
+csmatch = "csmatch.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
