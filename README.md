@@ -43,9 +43,9 @@ uv run csmatch --once           # one-shot text dump of current live matches
 
 Press `w` to switch between two visual themes. The default uses CS terminology directly. The alternate "monitor" theme re-labels everything as a build/SRE monitor — same numbers, different vocabulary.
 
-![monitor theme](docs/csmatch-monitor.jpeg)
+<p align="center"><img src="docs/csmatch-monitor.png" alt="monitor theme in narrow layout" width="640"></p>
 
-In the monitor theme the score column becomes `status`, maps become `clusters`, rounds become `iters`, kills render as arrowed events, and bomb plant / defuse become `[deploy]` / `[rollback]`. Player names and numbers stay readable. It's there because the dense, neutral layout reads well on smaller windows and is a pleasant change of pace from a screen full of red.
+In the monitor theme the score column becomes `status`, maps become `clusters`, rounds become `iters`, kills render as arrowed events, and bomb plant / defuse become `[deploy]` / `[rollback]`. Player names and numbers stay readable. The screenshot above also shows the narrow stacked layout (list above, scrollable detail below) that kicks in automatically when the terminal is under ~100 columns wide.
 
 ## How the live scorebot works
 
