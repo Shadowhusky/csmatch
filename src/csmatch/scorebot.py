@@ -35,15 +35,43 @@ except ImportError:  # pragma: no cover - playwright is an optional dep
 Side = Literal["CT", "T"]
 
 
-async def _hide_chromium_from_dock() -> None:
-    """Hide the Playwright-launched Chromium process from the macOS Dock
-    and Cmd-Tab switcher. Best-effort: silently swallows any failure
-    (osascript missing, permissions denied, process not yet visible)."""
-    # Playwright's bundled binary is named "Chromium". The headless
-    # Chrome / Chromium variant Playwright sometimes uses surfaces as
-    # "Chromium Helper" or "Headless Helper"; we cover the common
-    # variants. Each line is independent — if one match fails the rest
-    # still run.
+async def _capture_frontmost_app() -> str | None:
+    """Return the name of the macOS app currently in the foreground, or
+    None if we couldn't determine it. Used to restore focus after the
+    Chromium launch steals it."""
+    script = (
+        'tell application "System Events"\n'
+        '  set frontProc to first process whose frontmost is true\n'
+        '  return name of frontProc\n'
+        "end tell"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+        name = stdout.decode().strip()
+        # If our terminal was already calling osascript at launch we may
+        # see osascript itself as frontmost — skip that.
+        if not name or name.lower() in {"osascript", "chromium"} or "headless" in name.lower():
+            return None
+        return name
+    except Exception:
+        return None
+
+
+async def _hide_chromium_and_restore_focus(prev_frontmost: str | None) -> None:
+    """Hide Chromium from the Dock + Cmd-Tab AND bounce focus back to
+    the previously-active app (typically the user's terminal). Best-
+    effort: silently swallows osascript failures."""
+    safe = (prev_frontmost or "").replace("\\", "\\\\").replace('"', '\\"')
+    activate_block = (
+        f'  try\n    tell application "{safe}" to activate\n  end try\n'
+        if safe
+        else ""
+    )
     script = (
         'tell application "System Events"\n'
         '  try\n'
@@ -56,7 +84,8 @@ async def _hide_chromium_from_dock() -> None:
         '      set visible of p to false\n'
         '    end repeat\n'
         '  end try\n'
-        "end tell"
+        "end tell\n"
+        + activate_block
     )
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -432,6 +461,11 @@ class ScorebotBridge:
         Safe to call repeatedly; each call tears down any prior session.
         """
         await self.stop()
+        # On macOS, capture which app currently has focus so we can hand
+        # it back after Chromium launches and inevitably grabs focus.
+        prev_frontmost: str | None = None
+        if sys.platform == "darwin":
+            prev_frontmost = await _capture_frontmost_app()
         self._pw = await async_playwright().start()
         # We must launch *visible* — HLTV's Cloudflare/anti-bot kills the
         # scorebot WebSocket within a second when it detects headless
@@ -449,12 +483,12 @@ class ScorebotBridge:
                 "--mute-audio",
             ],
         )
-        # On macOS the off-screen window itself is invisible, but
-        # Chromium still puts a Dock icon up momentarily. Mark the
-        # process as not-visible via System Events so the icon never
-        # appears in the Dock or Cmd-Tab.
+        # On macOS Chromium grabs focus and shows up briefly in the Dock
+        # on launch. Hide it from the Dock/Cmd-Tab and bounce focus back
+        # to whatever app was frontmost before us (typically the user's
+        # terminal). The whole bounce lands within ~100ms.
         if sys.platform == "darwin":
-            await _hide_chromium_from_dock()
+            await _hide_chromium_and_restore_focus(prev_frontmost)
         self._context = await self._browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

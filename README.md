@@ -47,7 +47,7 @@ In the monitor theme the score column becomes `status`, maps become `clusters`, 
 
 ## How the live scorebot works
 
-HLTV streams real-time per-kill data over a Socket.IO endpoint that rejects every Python HTTP client (TLS fingerprint check) and silently drops subscribe events from anything that isn't a real browser. csmatch launches a Chromium pointed off-screen at `(-2400, -2400)`, lets HLTV's own JavaScript do the handshake, and reads the rendered DOM at 1Hz. On macOS the Chromium process is also hidden from the Dock and Cmd-Tab via `osascript`, so there's no icon flash either.
+HLTV streams real-time per-kill data over a Socket.IO endpoint that rejects every Python HTTP client (TLS fingerprint check) and silently drops subscribe events from anything that isn't a real browser. csmatch launches a Chromium pointed off-screen at `(-2400, -2400)`, lets HLTV's own JavaScript do the handshake, and reads the rendered DOM at 1Hz. On macOS the Chromium process is hidden from the Dock and Cmd-Tab via `osascript`, and focus is bounced back to whichever terminal app was frontmost so the launch doesn't steal your input.
 
 First run downloads Chromium (~200 MB).
 
