@@ -7,6 +7,7 @@ default; press `e` to expand the focused match into a full scoreboard.
 from __future__ import annotations
 
 import asyncio
+import random
 from datetime import datetime
 from typing import cast
 
@@ -35,9 +36,24 @@ from csmatch.sources.hltv import HLTVSource
 from csmatch.vocab import Vocab
 
 
-LIGHT_INTERVAL = 20.0  # seconds between list refreshes
-EXPANDED_INTERVAL = 8.0
-DETAIL_INTERVAL = 6.0  # how often we re-pull the focused match's detail
+# Poll cadences (seconds). Conservative defaults so we don't trip
+# upstream rate limits like HLTV's Cloudflare 1015. Each sleep is
+# additionally jittered by ±JITTER_FRAC so requests don't land on exact
+# intervals across IPs.
+LIGHT_INTERVAL = 45.0    # list refresh, no match expanded
+EXPANDED_INTERVAL = 25.0  # list refresh while a match is expanded
+DETAIL_INTERVAL = 15.0    # per-match detail fetch
+BACKOFF_INTERVAL = 90.0   # after an upstream rate-limit error
+JITTER_FRAC = 0.30
+
+
+def _jitter(base: float, frac: float = JITTER_FRAC) -> float:
+    return max(1.0, base * (1.0 + random.uniform(-frac, frac)))
+
+
+def _looks_like_rate_limit(err: BaseException) -> bool:
+    s = str(err).lower()
+    return any(token in s for token in ("429", "1015", "rate", "too many"))
 
 
 def _age_str(then: datetime | None) -> str:
@@ -700,14 +716,19 @@ class CsMatchApp(App):
 
     async def _poll_loop(self) -> None:
         while True:
-            await self._fetch_list_once()
-            interval = EXPANDED_INTERVAL if (self._detail and self._detail.expanded) else LIGHT_INTERVAL
+            backoff = await self._fetch_list_once()
+            if backoff:
+                interval = BACKOFF_INTERVAL
+            else:
+                interval = EXPANDED_INTERVAL if (self._detail and self._detail.expanded) else LIGHT_INTERVAL
             try:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(_jitter(interval))
             except asyncio.CancelledError:
                 return
 
-    async def _fetch_list_once(self) -> None:
+    async def _fetch_list_once(self) -> bool:
+        """Refresh the match list. Returns True if we should back off
+        further (upstream rate-limit detected)."""
         list_ = cast(MatchList, self._list)
         detail = cast(DetailPane, self._detail)
         status = cast(Static, self._status)
@@ -715,12 +736,16 @@ class CsMatchApp(App):
             matches = await self._source.list_live()
         except SourceError as e:
             self._last_err = str(e)
-            status.update(Text(f"× {e}", style="red"))
-            return
+            rate_limited = _looks_like_rate_limit(e)
+            msg = f"× rate-limited; backing off" if rate_limited else f"× {e}"
+            status.update(Text(msg, style="red"))
+            return rate_limited
         except Exception as e:
             self._last_err = f"{type(e).__name__}: {e}"
-            status.update(Text(f"× {self._last_err}", style="red"))
-            return
+            rate_limited = _looks_like_rate_limit(e)
+            msg = "× rate-limited; backing off" if rate_limited else f"× {self._last_err}"
+            status.update(Text(msg, style="red"))
+            return rate_limited
         self._last_err = None
         self._last_fetch = datetime.now()
         list_.render_matches(matches)
@@ -728,21 +753,33 @@ class CsMatchApp(App):
         detail.set_focus(focused)
         self.sub_title = f"{len(matches)} live · updated {_age_str(self._last_fetch)} ago"
         status.update(Text(f"✓ {len(matches)} live · {self._source.name} · last {_age_str(self._last_fetch)}", style="green"))
+        return False
 
     async def _detail_loop(self) -> None:
         while True:
             detail = cast(DetailPane, self._detail)
             list_ = cast(MatchList, self._list)
+            interval = DETAIL_INTERVAL
             if detail and detail.expanded:
                 m = list_.focused_match()
-                if m:
+                # Skip the HTTP detail fetch when the scorebot bridge is
+                # already streaming the same match — bridge data is
+                # richer AND avoids hammering /matches/<id> a second time.
+                bridge_owns_detail = (
+                    self._scorebot is not None
+                    and self._scorebot_match_id == (m.id if m else None)
+                    and detail._scorebot_status == "streaming"
+                )
+                if m and not bridge_owns_detail:
                     try:
                         d = await self._source.get_detail(m.id)
                         detail.set_detail(d)
                     except Exception as e:
                         detail.set_detail(None, err=f"{type(e).__name__}: {e}")
+                        if _looks_like_rate_limit(e):
+                            interval = BACKOFF_INTERVAL
             try:
-                await asyncio.sleep(DETAIL_INTERVAL)
+                await asyncio.sleep(_jitter(interval))
             except asyncio.CancelledError:
                 return
 

@@ -47,9 +47,13 @@ In the monitor theme the score column becomes `status`, maps become `clusters`, 
 
 ## How the live scorebot works
 
-HLTV streams real-time per-kill data over a Socket.IO endpoint that rejects every Python HTTP client (TLS fingerprint check) and silently drops subscribe events from anything that isn't a real browser. csmatch launches a headless-but-visible Chromium pointed off-screen at `(-2400, -2400)`, lets HLTV's own JavaScript do the handshake, and reads the rendered DOM at 1Hz. Invisible to you, real enough for the upstream check.
+HLTV streams real-time per-kill data over a Socket.IO endpoint that rejects every Python HTTP client (TLS fingerprint check) and silently drops subscribe events from anything that isn't a real browser. csmatch launches a Chromium pointed off-screen at `(-2400, -2400)`, lets HLTV's own JavaScript do the handshake, and reads the rendered DOM at 1Hz. On macOS the Chromium process is also hidden from the Dock and Cmd-Tab via `osascript`, so there's no icon flash either.
 
 First run downloads Chromium (~200 MB).
+
+## Rate-limit-friendly
+
+HLTV uses Cloudflare and will temp-ban IPs that poll too aggressively. csmatch ships with conservative defaults — 45 s for the match list, 25 s while a match is expanded, 15 s for per-match detail — plus ±30 % jitter so requests don't fire on exact intervals. When the live scorebot bridge is streaming a match, the redundant HTTP detail fetch is skipped entirely (the bridge already has richer data). An upstream `429` or Cloudflare `1015` is detected and the next poll backs off to 90 s automatically.
 
 ## Source comparison
 

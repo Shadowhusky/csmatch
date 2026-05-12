@@ -20,6 +20,7 @@ exposes events as an async queue.
 from __future__ import annotations
 
 import asyncio
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncIterator, Literal
@@ -32,6 +33,40 @@ except ImportError:  # pragma: no cover - playwright is an optional dep
 
 
 Side = Literal["CT", "T"]
+
+
+async def _hide_chromium_from_dock() -> None:
+    """Hide the Playwright-launched Chromium process from the macOS Dock
+    and Cmd-Tab switcher. Best-effort: silently swallows any failure
+    (osascript missing, permissions denied, process not yet visible)."""
+    # Playwright's bundled binary is named "Chromium". The headless
+    # Chrome / Chromium variant Playwright sometimes uses surfaces as
+    # "Chromium Helper" or "Headless Helper"; we cover the common
+    # variants. Each line is independent — if one match fails the rest
+    # still run.
+    script = (
+        'tell application "System Events"\n'
+        '  try\n'
+        '    repeat with p in (every process whose name is "Chromium")\n'
+        '      set visible of p to false\n'
+        '    end repeat\n'
+        '  end try\n'
+        '  try\n'
+        '    repeat with p in (every process whose name contains "Headless")\n'
+        '      set visible of p to false\n'
+        '    end repeat\n'
+        '  end try\n'
+        "end tell"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=3.0)
+    except Exception:
+        pass
 
 # Extracts the contents of .gamelog as structured rows. We rely on the
 # CSS class names rendered by HLTV's scorebot React component.
@@ -414,6 +449,12 @@ class ScorebotBridge:
                 "--mute-audio",
             ],
         )
+        # On macOS the off-screen window itself is invisible, but
+        # Chromium still puts a Dock icon up momentarily. Mark the
+        # process as not-visible via System Events so the icon never
+        # appears in the Dock or Cmd-Tab.
+        if sys.platform == "darwin":
+            await _hide_chromium_from_dock()
         self._context = await self._browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
