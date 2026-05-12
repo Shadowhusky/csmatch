@@ -26,6 +26,8 @@ uv run csmatch --source hltv    # full live scorebot
 uv run csmatch --once           # one-shot text dump of current live matches
 ```
 
+> **Heads-up for `--source hltv`:** the very first time you press `e` on a live match, csmatch launches a Chromium window in the background (positioned off-screen, hidden from the Dock, focus immediately bounced back to your terminal). It stays alive for the rest of the session — subsequent expands and match-cursor moves reuse the same browser silently. See [How the live scorebot works](#how-the-live-scorebot-works) below.
+
 ## Keys
 
 | key | action |

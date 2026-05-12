@@ -36,6 +36,38 @@ _NICK_RE = re.compile(r"'([^']+)'")
 _HALF_RE = re.compile(r"\((\d+)\s*:\s*(\d+)\s*;\s*(\d+)\s*:\s*(\d+)\)")
 
 
+_TEAM_NAME_ALIASES = {
+    "natus vincere": "navi",
+    "navi": "natus vincere",
+}
+
+
+def _norm_name(name: str | None) -> str:
+    return (name or "").strip().lower()
+
+
+def _enrich(m: Match, bo3_lookup: dict[tuple[str, str], Match]) -> Match:
+    """If bo3 has the same matchup, copy over map / map_index / score /
+    series_score from bo3 — HLTV's static HTML doesn't carry them."""
+    if not bo3_lookup:
+        return m
+    a, b = _norm_name(m.team_a.name), _norm_name(m.team_b.name)
+    bo3_m = bo3_lookup.get((a, b))
+    if bo3_m is None:
+        # Try common alias swap on either team
+        a2 = _TEAM_NAME_ALIASES.get(a, a)
+        b2 = _TEAM_NAME_ALIASES.get(b, b)
+        bo3_m = bo3_lookup.get((a2, b2)) or bo3_lookup.get((b2, a2))
+    if bo3_m is None:
+        return m
+    return m.model_copy(update={
+        "map": bo3_m.map or m.map,
+        "map_index": bo3_m.map_index or m.map_index,
+        "score": bo3_m.score or m.score,
+        "series_score": bo3_m.series_score or m.series_score,
+    })
+
+
 def _parse_match_wrapper(w: Node) -> Match | None:
     mid = w.attributes.get("data-match-id")
     if not mid:
@@ -180,7 +212,16 @@ class HLTVSource(MatchSource):
         return await asyncio.to_thread(_do)
 
     async def list_live(self) -> list[Match]:
-        html = await self._get("/matches")
+        # HLTV's /matches HTML leaves map name + scores as empty
+        # placeholders that its scorebot JS fills at runtime. We can't
+        # see them from a static fetch. To still surface map/score on
+        # the list we concurrently pull bo3.gg (which exposes the same
+        # data in JSON) and merge on team-name match.
+        html_task = asyncio.create_task(self._get("/matches"))
+        bo3_task = asyncio.create_task(self._fetch_bo3_enrichment())
+        html = await html_task
+        bo3_lookup = await bo3_task
+
         tree = HTMLParser(html)
         now = datetime.now(tz=timezone.utc)
         horizon = now + timedelta(hours=self._upcoming_hours)
@@ -194,7 +235,7 @@ class HLTVSource(MatchSource):
                 continue
             seen.add(m.id)
             if m.status == "live":
-                live.append(m)
+                live.append(_enrich(m, bo3_lookup))
             elif m.status == "upcoming" and m.started_at and m.started_at <= horizon:
                 upcoming.append(m)
 
@@ -202,6 +243,30 @@ class HLTVSource(MatchSource):
         upcoming.sort(key=lambda m: m.started_at or horizon)
         out = live + upcoming
         return out[: self._max_matches]
+
+    async def _fetch_bo3_enrichment(self) -> dict[tuple[str, str], Match]:
+        """Best-effort sidecar fetch of bo3.gg's live list, keyed by
+        (lower-cased team_a, lower-cased team_b) — both orientations so
+        a HLTV match can match either way around. Empty dict on any
+        failure (we never want a bo3 hiccup to break the HLTV view)."""
+        try:
+            # Local import to keep the module-level dep graph clean and
+            # to allow HLTVSource to be used in isolation.
+            from csmatch.sources.bo3gg import BO3Source
+            bo3 = BO3Source(upcoming_hours=0)  # live-only
+            matches = await bo3.list_live()
+        except Exception:
+            return {}
+        lookup: dict[tuple[str, str], Match] = {}
+        for m in matches:
+            if m.status != "live":
+                continue
+            a, b = _norm_name(m.team_a.name), _norm_name(m.team_b.name)
+            if not a or not b:
+                continue
+            lookup[(a, b)] = m
+            lookup[(b, a)] = m
+        return lookup
 
     async def get_detail(self, match_id: str) -> MatchDetail:
         # HLTV needs a slug suffix; passing any slug works and the server
