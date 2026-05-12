@@ -870,23 +870,56 @@ class CsMatchApp(App):
                 asyncio.create_task(self._start_scorebot(m))
 
     async def _start_scorebot(self, m: Match) -> None:
-        """Tear down any existing bridge and start a new one for this match."""
-        await self._stop_scorebot()
+        """Bring the scorebot bridge online for match `m`.
+
+        Reuses the existing browser session whenever possible — only the
+        very first call launches Chromium (and pays the focus-steal
+        cost). Subsequent calls navigate the same page to the new
+        match's URL and resume the poll loop."""
         detail = cast(DetailPane, self._detail)
-        detail.reset_scorebot()
-        detail.set_scorebot_status("starting")
-        try:
-            self._scorebot = ScorebotBridge(poll_interval=1.0)
-            url = f"https://www.hltv.org/matches/{m.id}/x"
-            self._scorebot_match_id = m.id
-            await self._scorebot.start(url)
-        except Exception as e:
-            self._scorebot = None
-            self._scorebot_match_id = None
-            detail.set_scorebot_status(f"failed: {type(e).__name__}: {e}"[:80])
+        url = f"https://www.hltv.org/matches/{m.id}/x"
+
+        # Fast path: bridge already running on this match — nothing to do.
+        if (
+            self._scorebot is not None
+            and self._scorebot_match_id == m.id
+            and self._scorebot.is_running
+        ):
             return
+
+        # Path 1 — bridge not yet created: full launch (one-time focus cost).
+        if self._scorebot is None:
+            detail.reset_scorebot()
+            detail.set_scorebot_status("starting")
+            try:
+                self._scorebot = ScorebotBridge(poll_interval=1.0)
+                await self._scorebot.start(url)
+            except Exception as e:
+                self._scorebot = None
+                self._scorebot_match_id = None
+                detail.set_scorebot_status(f"failed: {type(e).__name__}: {e}"[:80])
+                return
+            self._scorebot_match_id = m.id
+            detail.set_scorebot_status("waiting")
+            self._scorebot_task = asyncio.create_task(self._scorebot_pump())
+            return
+
+        # Path 2 — bridge exists: navigate to new match OR resume on same.
+        detail.reset_scorebot()
         detail.set_scorebot_status("waiting")
-        self._scorebot_task = asyncio.create_task(self._scorebot_pump())
+        if self._scorebot_match_id != m.id:
+            try:
+                await self._scorebot.navigate(url)
+            except Exception as e:
+                detail.set_scorebot_status(f"failed: {type(e).__name__}: {e}"[:80])
+                return
+            self._scorebot_match_id = m.id
+        else:
+            # Same match — just unpause.
+            self._scorebot.resume()
+        # The pump task may have ended when we paused; restart if so.
+        if self._scorebot_task is None or self._scorebot_task.done():
+            self._scorebot_task = asyncio.create_task(self._scorebot_pump())
 
     async def _scorebot_pump(self) -> None:
         if self._scorebot is None:
@@ -898,11 +931,20 @@ class CsMatchApp(App):
         except asyncio.CancelledError:
             return
         except Exception as e:
-            # Surface to the UI instead of dying silently — the user
-            # would otherwise see "starting" forever.
             detail.set_scorebot_status(f"failed: {type(e).__name__}: {e}"[:100])
 
     async def _stop_scorebot(self) -> None:
+        """Pause the bridge without closing the browser. The Chromium
+        process stays alive so a later expand doesn't re-trigger a
+        focus-stealing launch."""
+        if self._scorebot is not None:
+            try:
+                self._scorebot.pause()
+            except Exception:
+                pass
+
+    async def _destroy_scorebot(self) -> None:
+        """Fully tear down the bridge — only on app exit."""
         if self._scorebot_task and not self._scorebot_task.done():
             self._scorebot_task.cancel()
             try:
@@ -922,5 +964,5 @@ class CsMatchApp(App):
         for task in (self._poller_task, self._detail_task):
             if task:
                 task.cancel()
-        await self._stop_scorebot()
+        await self._destroy_scorebot()
         await self._source.close()

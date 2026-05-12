@@ -558,6 +558,49 @@ class ScorebotBridge:
         for row in data.get("rows", []):
             self._add_seen_key(_row_key(row))
 
+    async def navigate(self, match_url: str) -> None:
+        """Point the existing browser at a different match without
+        re-launching it. Keeps the focus-steal cost to once-per-app."""
+        if self._page is None:
+            # Bridge wasn't started; this is a programmer error but be
+            # forgiving — fall back to a full start.
+            await self.start(match_url)
+            return
+        # Stop the poll loop while we navigate so it doesn't read a
+        # transitional DOM and emit junk events.
+        self.pause()
+        try:
+            await self._page.goto(match_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            await self._queue.put(_error_event(f"navigate: {e}"))
+            return
+        # New match → reset dedup + state; reprime fresh.
+        self._seen_keys.clear()
+        self._seen_keys_set.clear()
+        self._latest_state = None
+        await asyncio.sleep(2.0)
+        await self._prime()
+        self.resume()
+
+    def pause(self) -> None:
+        """Stop the poll loop but keep the browser alive."""
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self._task = None
+
+    def resume(self) -> None:
+        """Restart the poll loop after a pause. No-op if already running
+        or if start() was never called."""
+        if self._task and not self._task.done():
+            return
+        if self._page is None:
+            return
+        self._task = asyncio.create_task(self._loop())
+
+    @property
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
     async def stop(self) -> None:
         if self._task and not self._task.done():
             self._task.cancel()
