@@ -311,6 +311,58 @@ _EXTRACT_JS = r"""
         }
         out.rows.push(row);
     });
+
+    // ── round-attribution walk ──────────────────────────────────────
+    // The gamelog accumulates across rounds AND across maps, but
+    // scoreboard.round resets at every new map. So stamping each event
+    // with the live scoreboard's round mis-labels both (a) events from
+    // earlier maps and (b) the last few kills of round N when the poll
+    // landed just after round N+1 began.
+    //
+    // We walk newest-to-oldest and rebuild round numbers from the
+    // ground truth in the log itself:
+    //   - A roundOver row carries (tScore - ctScore); their sum is the
+    //     round that just ended.
+    //   - A roundStart row advances the round counter by 1 going from
+    //     newer to older (the round started here; older events were in
+    //     the previous round).
+    //   - A roundOver with score >= 13 marks the END of a map: older
+    //     events belong to a previous map (mapsAgo += 1).
+    // Map boundaries (from this walk's perspective) sit at "R1 started"
+    // markers — anything OLDER than the R1 start of map M is from map
+    // M-1. We bump mapsAgo there, not at the map-end round_over (which
+    // is *inside* the older map's stream).
+    const stateRound = (out.scoreboard && out.scoreboard.round) || null;
+    let current = stateRound;
+    let mapsAgo = 0;
+    out.rows.forEach(row => {
+        if (row.kind === 'roundOver') {
+            const a = row.tScore || 0;
+            const b = row.ctScore || 0;
+            const justEnded = a + b;
+            row.round = justEnded > 0 ? justEnded : current;
+            row.mapsAgo = mapsAgo;
+            // The round-over for round N is itself inside round N's
+            // territory: older events here are still in round N until
+            // we hit round N's start. Keep current = justEnded.
+            current = justEnded > 0 ? justEnded : current;
+        } else if (row.kind === 'roundStart') {
+            row.round = current;
+            row.mapsAgo = mapsAgo;
+            if (current != null && current > 1) {
+                current -= 1;
+            } else {
+                // We just walked past R1 of the current visible map —
+                // older events are from the previous map.
+                mapsAgo += 1;
+                current = null;
+            }
+        } else {
+            row.round = current;
+            row.mapsAgo = mapsAgo;
+        }
+    });
+
     return out;
 }
 """
@@ -668,16 +720,27 @@ class ScorebotBridge:
             if series_raw:
                 await self._queue.put(_to_series(series_raw))
 
-            current_round = self._latest_state.round if self._latest_state else None
             current_map = self._latest_state.map if self._latest_state else None
             for row in data.get("rows", []) or []:
                 key = _row_key(row)
                 if key in self._seen_keys_set:
                     continue
                 self._add_seen_key(key)
+                # Drop events from earlier maps. The gamelog accumulates
+                # across maps but our UI only ever shows the current
+                # map's log; emitting them just pollutes the feed with
+                # wrongly-tagged history.
+                if (row.get("mapsAgo") or 0) > 0:
+                    continue
                 evt = _to_event(row)
                 if evt is not None:
-                    evt.round = current_round
+                    # Prefer the row-derived round (computed from the
+                    # log's own ground truth — round-over scores +
+                    # round-start markers). Fall back to the live
+                    # scoreboard's round if we couldn't derive one.
+                    evt.round = row.get("round") or (
+                        self._latest_state.round if self._latest_state else None
+                    )
                     evt.map = current_map
                     await self._queue.put(evt)
 
