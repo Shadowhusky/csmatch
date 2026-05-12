@@ -62,18 +62,46 @@ async def _capture_frontmost_app() -> str | None:
         return None
 
 
+_COMMON_TERMINAL_APPS = (
+    "Terminal", "iTerm2", "iTerm", "Warp", "WezTerm", "Alacritty",
+    "kitty", "Hyper", "Tabby", "Ghostty", "Code", "Cursor", "Windsurf",
+)
+
+
 async def _hide_chromium_and_restore_focus(prev_frontmost: str | None) -> None:
-    """Hide Chromium from the Dock + Cmd-Tab AND bounce focus back to
-    the previously-active app (typically the user's terminal). Best-
-    effort: silently swallows osascript failures."""
-    safe = (prev_frontmost or "").replace("\\", "\\\\").replace('"', '\\"')
-    activate_block = (
-        f'  try\n    tell application "{safe}" to activate\n  end try\n'
-        if safe
-        else ""
-    )
+    """Bounce focus back to the previously-active app and hide Chromium
+    from the Dock / Cmd-Tab. The bounce uses `set frontmost ... to true`
+    via System Events — more reliable than `tell app ... to activate`
+    because it talks at the process level and doesn't depend on the
+    app bundle's display name matching the process name.
+
+    Order matters: activate the target first (steals focus from
+    Chromium) THEN hide Chromium (cleans up the Dock icon)."""
+    candidates: list[str] = []
+    if prev_frontmost:
+        candidates.append(prev_frontmost)
+    for fallback in _COMMON_TERMINAL_APPS:
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    # Try each candidate in turn — first one that exists as a running
+    # process gets focus. AppleScript silently skips ones that aren't.
+    activate_block = ""
+    for name in candidates:
+        safe = name.replace("\\", "\\\\").replace('"', '\\"')
+        activate_block += (
+            f'  try\n'
+            f'    if exists (first process whose name is "{safe}") then\n'
+            f'      set frontmost of (first process whose name is "{safe}") to true\n'
+            f'      set didActivate to true\n'
+            f'    end if\n'
+            f'  end try\n'
+        )
+
     script = (
         'tell application "System Events"\n'
+        '  set didActivate to false\n'
+        + activate_block +
         '  try\n'
         '    repeat with p in (every process whose name is "Chromium")\n'
         '      set visible of p to false\n'
@@ -84,16 +112,25 @@ async def _hide_chromium_and_restore_focus(prev_frontmost: str | None) -> None:
         '      set visible of p to false\n'
         '    end repeat\n'
         '  end try\n'
-        "end tell\n"
-        + activate_block
+        "end tell"
     )
     try:
         proc = await asyncio.create_subprocess_exec(
             "osascript", "-e", script,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        await asyncio.wait_for(proc.wait(), timeout=3.0)
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+        if proc.returncode != 0 and b"not allowed" in (stderr or b"").lower():
+            # macOS Automation permission was denied. Hint visibly so
+            # the user knows why focus isn't bouncing back.
+            print(
+                "\ncsmatch: macOS Automation permission needed to "
+                "control 'System Events' — grant it under System "
+                "Settings → Privacy & Security → Automation, otherwise "
+                "Chromium will keep stealing focus on launch.\n",
+                flush=True,
+            )
     except Exception:
         pass
 
@@ -483,11 +520,14 @@ class ScorebotBridge:
                 "--mute-audio",
             ],
         )
-        # On macOS Chromium grabs focus and shows up briefly in the Dock
-        # on launch. Hide it from the Dock/Cmd-Tab and bounce focus back
-        # to whatever app was frontmost before us (typically the user's
-        # terminal). The whole bounce lands within ~100ms.
+        # On macOS Chromium grabs focus and briefly shows in the Dock
+        # on launch. Hide it and bounce focus back to whatever app was
+        # frontmost before us. Wait ~250ms for macOS to finish
+        # activating Chromium first, otherwise our `set frontmost`
+        # fires before Chromium's activation is in the system event
+        # queue and gets overwritten by it.
         if sys.platform == "darwin":
+            await asyncio.sleep(0.25)
             await _hide_chromium_and_restore_focus(prev_frontmost)
         self._context = await self._browser.new_context(
             user_agent=(
