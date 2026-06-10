@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
 
@@ -17,7 +18,10 @@ from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import DataTable, Footer, Header, Static
 
+from csmatch import locations
+from csmatch.analysis import Annotation, RoundSummary, RoundTracker
 from csmatch.models import Match, MatchDetail
+from csmatch.narrate import narrate
 from csmatch.scorebot import (
     BombDefuseEvent,
     BombPlantEvent,
@@ -186,6 +190,18 @@ class MatchList(DataTable):
         return self._row_to_match.get(self.cursor_row)
 
 
+@dataclass
+class LogEntry:
+    """One enriched live event: the raw event, its analysis annotation,
+    and (for kills) an approximate map zone. `epoch` increments on each
+    round start so e.g. warmup kills (which HLTV reports as round 1) don't
+    merge into the real round 1's block."""
+    event: ScorebotEvent
+    annotation: Annotation
+    location: str | None = None
+    epoch: int = 0
+
+
 class DetailPane(Static):
     """Right pane showing the focused match. Light or expanded."""
 
@@ -201,17 +217,21 @@ class DetailPane(Static):
         self._prev_kills: dict[str, int] = {}
         # Rolling event log (polling-derived deltas)
         self._kill_feed: list[tuple[datetime, str, str, int]] = []
-        # Live scorebot feed (Playwright bridge). Each entry is one of the
-        # ScorebotEvent subclasses or a ScoreboardState snapshot.
+        # Live scorebot feed (Playwright bridge). Each log entry holds the
+        # ScorebotEvent plus its analysis annotation + kill location.
         self._scorebot_state: ScoreboardState | None = None
-        self._scorebot_events: list[ScorebotEvent] = []
+        self._scorebot_log: list[LogEntry] = []
+        self._log_epoch = 0
+        self._tracker = RoundTracker()
         self._scorebot_players: PlayerScoreboard | None = None
         self._scorebot_series: SeriesSnapshot | None = None
         self._scorebot_status: str | None = None
         self._vocab: Vocab = Vocab(monitor=False)
+        self._view_mode: str = "default"
 
-    def apply_vocab(self, vocab: Vocab) -> None:
+    def apply_vocab(self, vocab: Vocab, view_mode: str = "default") -> None:
         self._vocab = vocab
+        self._view_mode = view_mode
         self._repaint()
 
     def on_mount(self) -> None:
@@ -227,7 +247,9 @@ class DetailPane(Static):
             self._prev_kills.clear()
             self._kill_feed.clear()
             self._scorebot_state = None
-            self._scorebot_events.clear()
+            self._scorebot_log.clear()
+            self._log_epoch = 0
+            self._tracker = RoundTracker()
         self._repaint()
 
     def push_scorebot(
@@ -242,6 +264,7 @@ class DetailPane(Static):
             self._scorebot_state = item
         elif isinstance(item, PlayerScoreboard):
             self._scorebot_players = item
+            self._tracker.feed_players(item)
         elif isinstance(item, SeriesSnapshot):
             self._scorebot_series = item
         else:
@@ -253,9 +276,19 @@ class DetailPane(Static):
             # row temporarily reappears in the virtualised gamelog.
             if self._is_duplicate(item):
                 return
-            self._scorebot_events.append(item)
-            if len(self._scorebot_events) > self.KILL_FEED_MAX:
-                self._scorebot_events = self._scorebot_events[-self.KILL_FEED_MAX:]
+            ann = self._tracker.feed_event(item)
+            location = (
+                locations.zone_for(item.map, item.victim_x, item.victim_y)
+                if isinstance(item, KillEvent)
+                else None
+            )
+            if isinstance(item, RoundStartEvent):
+                self._log_epoch += 1
+            self._scorebot_log.append(
+                LogEntry(event=item, annotation=ann, location=location, epoch=self._log_epoch)
+            )
+            if len(self._scorebot_log) > self.KILL_FEED_MAX:
+                self._scorebot_log = self._scorebot_log[-self.KILL_FEED_MAX:]
         self._repaint()
 
     @staticmethod
@@ -280,13 +313,13 @@ class DetailPane(Static):
         return (e.kind, e.round)
 
     def _is_duplicate(self, incoming: ScorebotEvent) -> bool:
-        if not self._scorebot_events:
+        if not self._scorebot_log:
             return False
         fp = self._event_fingerprint(incoming)
         # Scan back up to N recent events for the same fingerprint. Most
         # dupes arrive within a couple of ticks of each other.
-        for prev in reversed(self._scorebot_events[-10:]):
-            if self._event_fingerprint(prev) == fp:
+        for entry in reversed(self._scorebot_log[-10:]):
+            if self._event_fingerprint(entry.event) == fp:
                 return True
         return False
 
@@ -296,7 +329,9 @@ class DetailPane(Static):
 
     def reset_scorebot(self) -> None:
         self._scorebot_state = None
-        self._scorebot_events.clear()
+        self._scorebot_log.clear()
+        self._log_epoch = 0
+        self._tracker = RoundTracker()
         self._scorebot_players = None
         self._scorebot_series = None
         self._scorebot_status = None
@@ -532,34 +567,92 @@ class DetailPane(Static):
                 label = status
             text.append(label + "\n", style=style)
 
-        if self._scorebot_events:
+        if self._scorebot_log:
             text.append(f"\n{v.event_log_section}:\n", style="bold")
-            last_round: int | None = None
-            for evt in reversed(self._scorebot_events):
-                age = _age_str(evt.ts)
-                # Round-change separator so the user can anchor when
-                # scrolling back through a long log.
-                if evt.round is not None and evt.round != last_round:
-                    text.append(f"  ── {v.round_prefix}{evt.round}", style="dim cyan")
-                    if evt.map:
-                        text.append(f"  {v.map_name(evt.map) or evt.map}", style="dim")
-                    text.append(" ──\n", style="dim cyan")
-                    last_round = evt.round
+            if self._view_mode == "narrative":
+                self._render_narrative_log(text)
+            else:
+                self._render_structured_log(text)
+        elif self._kill_feed:
+            # Fallback: poll-derived deltas (used for non-HLTV sources)
+            text.append(f"\n{v.event_log_section}:\n", style="bold")
+            for ts, side, nick, n in reversed(self._kill_feed):
+                color = "green" if side == "A" else "red"
+                age = _age_str(ts)
                 text.append(f"  {age:>4}  ")
+                text.append(nick, style=color)
+                if v.monitor:
+                    text.append(f"  +{n}  ok\n", style="dim")
+                elif n == 1:
+                    text.append(" got a kill\n", style="dim")
+                else:
+                    text.append(f"  +{n} kills\n", style="dim")
+
+        if d.fetched_at:
+            text.append(f"\nupdated {_age_str(d.fetched_at)} ago\n", style="dim")
+        return text
+
+    # ── event-log rendering ────────────────────────────────────────────
+
+    def _round_blocks(self) -> list[list[LogEntry]]:
+        """Group the log into per-round blocks, preserving arrival order
+        within each block. Keyed by (map, round) — round numbers repeat
+        across maps, so map must take part. Events with no round stick to
+        the current block. Blocks are returned oldest-first; callers render
+        them newest-first with entries chronological inside each block."""
+        blocks: list[list[LogEntry]] = []
+        cur_key: tuple | None = None
+        for entry in self._scorebot_log:
+            r = entry.event.round
+            key = (entry.event.map, r, entry.epoch) if r is not None else cur_key
+            if not blocks or key != cur_key:
+                blocks.append([])
+                cur_key = key
+            blocks[-1].append(entry)
+        return blocks
+
+    @staticmethod
+    def _block_result(entries: list[LogEntry]) -> Annotation | None:
+        """The block's round-over annotation (result + any won clutch)."""
+        for entry in entries:
+            if isinstance(entry.event, RoundOverEvent):
+                return entry.annotation
+        return None
+
+    def _result_label(self, summary: RoundSummary) -> tuple[str, str]:
+        """`(winner-word, 'win · reason · t-ct')` for a round header. Winner
+        word is returned separately so it can carry the side colour; it
+        prefers the team name over the bare side label."""
+        v = self._vocab
+        winner = summary.winner_team or v.side_label(summary.winner_side) or summary.winner_side
+        reason = v.reason(summary.reason) if v.monitor else _short_reason(summary.reason)
+        verb = "ok" if v.monitor else "win"
+        score = f"{summary.t_score or 0}-{summary.ct_score or 0}"
+        suffix = f"{verb} · {reason} · {score}" if reason else f"{verb} · {score}"
+        return winner, suffix
+
+    def _render_structured_log(self, text: Text) -> None:
+        v = self._vocab
+        for entries in reversed(self._round_blocks()):
+            res = self._block_result(entries)
+            header_evt = next((e.event for e in entries if e.event.round is not None), None)
+            if header_evt is not None:
+                self._structured_header(text, header_evt, res)
+            for entry in entries:
+                evt = entry.event
+                ann = entry.annotation
+                # The round result is folded into the header; the round-over
+                # entry renders only its won-clutch line (chronologically
+                # the block's closing beat).
+                if isinstance(evt, RoundOverEvent):
+                    if ann.clutch and ann.clutcher:
+                        digits = ann.clutch.removeprefix("1v")
+                        n = int(digits) if digits.isdigit() else 0
+                        text.append(f"        ⤷ {ann.clutcher} {v.clutch_tag(n)}\n", style="dim cyan")
+                    continue
+                text.append(f"  {_age_str(evt.ts):>4}  ")
                 if isinstance(evt, KillEvent):
-                    killer_style = "yellow" if evt.killer_side == "T" else "blue"
-                    victim_style = "yellow" if evt.victim_side == "T" else "blue"
-                    text.append(evt.killer, style=f"bold {killer_style}")
-                    if evt.assist:
-                        text.append(" + ", style="dim")
-                        text.append(evt.assist, style="dim cyan")
-                    text.append(f" {v.kill_arrow} ", style="dim")
-                    text.append(evt.victim, style=f"bold {victim_style}")
-                    if evt.weapon and not v.hide_weapon():
-                        text.append(f"  [{evt.weapon}]", style="dim")
-                    if evt.headshot:
-                        text.append(f"  {v.headshot_tag}", style="bold red")
-                    text.append("\n")
+                    self._render_kill(text, evt, ann, entry.location)
                 elif isinstance(evt, BombPlantEvent):
                     text.append(f"{v.bomb_plant_tag}  ", style="bold red")
                     text.append(evt.planter, style="bold yellow")
@@ -579,36 +672,89 @@ class DetailPane(Static):
                     text.append("\n")
                 elif isinstance(evt, RoundStartEvent):
                     text.append(f"{v.round_start_tag}\n", style="dim")
-                elif isinstance(evt, RoundOverEvent):
-                    text.append(f"{v.round_over_tag}  ", style="bold")
-                    side_style = "yellow" if evt.winner_side == "T" else "blue"
-                    text.append(v.side_label(evt.winner_side) or evt.winner_side, style=f"bold {side_style}")
-                    text.append(f"  ({evt.t_score or 0}-{evt.ct_score or 0})  ", style="dim")
-                    text.append(v.reason(evt.reason) or "", style="dim italic")
-                    text.append("\n")
                 elif isinstance(evt, OtherEvent):
                     text.append(evt.text, style="dim italic")
                     text.append("\n")
                 else:
                     text.append(f"{evt.kind}\n", style="dim")
-        elif self._kill_feed:
-            # Fallback: poll-derived deltas (used for non-HLTV sources)
-            text.append(f"\n{v.event_log_section}:\n", style="bold")
-            for ts, side, nick, n in reversed(self._kill_feed):
-                color = "green" if side == "A" else "red"
-                age = _age_str(ts)
-                text.append(f"  {age:>4}  ")
-                text.append(nick, style=color)
-                if v.monitor:
-                    text.append(f"  +{n}  ok\n", style="dim")
-                elif n == 1:
-                    text.append(" got a kill\n", style="dim")
-                else:
-                    text.append(f"  +{n} kills\n", style="dim")
 
-        if d.fetched_at:
-            text.append(f"\nupdated {_age_str(d.fetched_at)} ago\n", style="dim")
-        return text
+    def _structured_header(self, text: Text, evt: ScorebotEvent, res: Annotation | None) -> None:
+        v = self._vocab
+        text.append(f"  ── {v.round_prefix}{evt.round}", style="dim cyan")
+        if evt.map:
+            text.append(f"  {v.map_name(evt.map) or evt.map}", style="dim")
+        text.append(" ──", style="dim cyan")
+        if res is not None and res.summary is not None:
+            winner, suffix = self._result_label(res.summary)
+            side_style = "yellow" if res.summary.winner_side == "T" else "blue"
+            text.append("  ", style="dim")
+            text.append(winner, style=f"bold {side_style}")
+            text.append(f" {suffix}", style="dim")
+        text.append("\n")
+
+    def _render_kill(self, text: Text, evt: KillEvent, ann: Annotation, location: str | None) -> None:
+        v = self._vocab
+        killer_style = "yellow" if evt.killer_side == "T" else "blue"
+        victim_style = "yellow" if evt.victim_side == "T" else "blue"
+        text.append(evt.killer, style=f"bold {killer_style}")
+        if evt.assist:
+            text.append(" + ", style="dim")
+            text.append(evt.assist, style="dim cyan")
+        text.append(f" {v.kill_arrow} ", style="dim")
+        text.append(evt.victim, style=f"bold {victim_style}")
+        if evt.weapon and not v.hide_weapon():
+            text.append(f"  [{evt.weapon}]", style="dim")
+        if evt.headshot:
+            text.append(f"  {v.headshot_tag}", style="bold red")
+        if ann.opening:
+            text.append(f"  ·{v.opening_tag}", style="dim")
+        if ann.multikill >= 3:
+            text.append(f"  ·{v.multikill_tag(ann.multikill)}", style="dim")
+        loc = v.location(location)
+        if loc:
+            text.append(f"   {loc}", style="dim")
+        text.append("\n")
+
+    def _render_narrative_log(self, text: Text) -> None:
+        v = self._vocab
+        for entries in reversed(self._round_blocks()):
+            res = self._block_result(entries)
+            header_evt = next((e.event for e in entries if e.event.round is not None), None)
+            if header_evt is not None:
+                text.append(f"  ── round {header_evt.round}", style="dim cyan")
+                if header_evt.map:
+                    text.append(f" · {v.map_name(header_evt.map) or header_evt.map}", style="dim")
+                if res is not None and res.summary is not None:
+                    s = res.summary
+                    winner = s.winner_team or v.side_label(s.winner_side) or s.winner_side
+                    side_style = "yellow" if s.winner_side == "T" else "blue"
+                    text.append(" · ", style="dim")
+                    text.append(winner, style=f"bold {side_style}")
+                    text.append(f" win {s.t_score or 0}-{s.ct_score or 0}", style="dim")
+                text.append(" ──\n", style="dim cyan")
+            for entry in entries:
+                sentence = narrate(entry.event, entry.annotation, entry.location)
+                if not sentence:
+                    continue
+                text.append(f"  {_age_str(entry.event.ts):>4}  ")
+                text.append(f"{sentence}\n")
+
+
+def _short_reason(reason: str | None) -> str:
+    """Compact one-word round result for the default header."""
+    if not reason:
+        return ""
+    return _SHORT_REASON.get(reason, reason.lower())
+
+
+_SHORT_REASON = {
+    "Enemy eliminated": "elim",
+    "Target bombed": "bombed",
+    "Bomb defused": "defused",
+    "Target saved": "saved",
+    "Time": "time",
+    "Round draw": "draw",
+}
 
 
 class CsMatchApp(App):
@@ -633,8 +779,7 @@ class CsMatchApp(App):
         Binding("q", "quit", "quit"),
         Binding("e", "expand", "expand"),
         Binding("f", "zoom", "fullscreen"),
-        # Kept out of the footer to keep the chrome minimal.
-        Binding("w", "toggle_view", "toggle", show=False),
+        Binding("w", "toggle_view", "view"),
         Binding("escape", "zoom_off", "exit fullscreen", show=False),
         Binding("r", "refresh", "refresh"),
         Binding("pageup", "scroll_detail_up", "scroll up", show=False),
@@ -647,6 +792,10 @@ class CsMatchApp(App):
 
     def __init__(self, source: MatchSource) -> None:
         super().__init__()
+        # ANSI theme: inherit the terminal's own palette/background instead
+        # of forcing Textual's. Users can still cycle themes via the
+        # command palette.
+        self.theme = "ansi-dark"
         self._source = source
         self._list: MatchList | None = None
         self._detail: DetailPane | None = None
@@ -661,20 +810,32 @@ class CsMatchApp(App):
         self._scorebot: ScorebotBridge | None = None
         self._scorebot_task: asyncio.Task | None = None
         self._scorebot_match_id: str | None = None
-        self._monitor_mode: bool = False
+        # Display mode cycles default → narrative → monitor. The monitor
+        # theme is the only one that re-skins vocab; narrative changes only
+        # the event-log render path.
+        self._view_mode: str = "default"
+
+    _VIEW_MODES = ("default", "narrative", "monitor")
 
     @property
     def vocab(self) -> Vocab:
-        return Vocab(monitor=self._monitor_mode)
+        return Vocab(monitor=self._view_mode == "monitor")
+
+    def _apply_title(self) -> None:
+        # Mode in the title pairs with the footer's `w view` hint, so the
+        # current view is always visible and the cycle has feedback.
+        v = self.vocab
+        self.title = f"{v.app_title} · {self._source.name} · {self._view_mode} view"
 
     def action_toggle_view(self) -> None:
-        self._monitor_mode = not self._monitor_mode
+        i = self._VIEW_MODES.index(self._view_mode)
+        self._view_mode = self._VIEW_MODES[(i + 1) % len(self._VIEW_MODES)]
         v = self.vocab
-        self.title = f"{v.app_title} · {self._source.name}"
+        self._apply_title()
         if self._list is not None:
             self._list.apply_vocab(v)
         if self._detail is not None:
-            self._detail.apply_vocab(v)
+            self._detail.apply_vocab(v, self._view_mode)
         asyncio.create_task(self._fetch_list_once())
 
     def compose(self) -> ComposeResult:
@@ -705,8 +866,8 @@ class CsMatchApp(App):
         v = self.vocab
         list_.apply_vocab(v)
         if self._detail is not None:
-            self._detail.apply_vocab(v)
-        self.title = f"{v.app_title} · {self._source.name}"
+            self._detail.apply_vocab(v, self._view_mode)
+        self._apply_title()
         self.sub_title = "loading…"
         # Initial layout based on starting terminal size.
         if self.size.width < self.NARROW_THRESHOLD:

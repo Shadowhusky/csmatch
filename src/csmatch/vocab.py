@@ -18,6 +18,16 @@ _REASON_REWRITE = {
     "Time": "timeout",
 }
 
+_ZONE_REWRITE = {
+    "A site": "sector A",
+    "B site": "sector B",
+    "A approach": "sector A edge",
+    "B approach": "sector B edge",
+    "mid": "core",
+    "T spawn": "node b0",
+    "CT spawn": "node a0",
+}
+
 
 class Vocab:
     def __init__(self, monitor: bool = False) -> None:
@@ -115,6 +125,19 @@ class Vocab:
         # the bomb emoji so the row reads as plain text.
         return "▲" if self.monitor else "💣"
 
+    # ── live-log markers (opening / multikill / clutch) ────────────
+    @property
+    def opening_tag(self) -> str:
+        return "entry" if self.monitor else "opening"
+
+    def multikill_tag(self, n: int) -> str:
+        if self.monitor:
+            return f"x{n}"
+        return "ACE" if n >= 5 else f"{n}K"
+
+    def clutch_tag(self, n: int) -> str:
+        return f"solo-recover 1v{n}" if self.monitor else f"1v{n} clutch"
+
     # ── scoreboard column headers ──────────────────────────────────
     def player_header(self, compact: bool) -> str:
         if self.monitor:
@@ -175,3 +198,10 @@ class Vocab:
 
     def hide_weapon(self) -> bool:
         return self.monitor
+
+    def location(self, zone: str | None) -> str | None:
+        """Kill-zone label. The monitor theme rewords bombsite zones so
+        they read as infra sectors rather than CS callouts."""
+        if not zone or not self.monitor:
+            return zone
+        return _ZONE_REWRITE.get(zone, zone.lower())

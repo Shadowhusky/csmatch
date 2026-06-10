@@ -9,7 +9,7 @@
 - **Watch matches without a browser.** Series score, current map, round timer, per-player K/A/D/HP/$/ADR — every second, in plain text.
 - **Real per-kill feed.** With weapon, headshot, assist, and bomb plant/defuse. The same data HLTV streams to its match center page.
 - **What's on next.** Upcoming today, with countdowns.
-- **Alternate "monitor" theme** (toggleable). The same data, in a build/SRE-monitor vocabulary — see below.
+- **Three display modes** (cycle with `w`): structured CS log, natural-language play-by-play, and a build/SRE-monitor disguise — see below.
 
 ## Install
 
@@ -35,17 +35,24 @@ uv run csmatch --once           # one-shot text dump of current live matches
 | `↑` `↓` | move focus |
 | `e` | expand the focused match |
 | `f` | fullscreen the detail pane (`Esc` to exit) |
+| `w` | cycle display mode: default → narrative → monitor |
 | `PgUp` `PgDn` / `j` `k` | scroll detail |
 | `r` | refresh now |
 | `q` | quit |
 
 ## Themes
 
-Press `w` to switch between two visual themes. The default uses CS terminology directly. The alternate "monitor" theme re-labels everything as a build/SRE monitor — same numbers, different vocabulary.
+Press `w` to cycle three display modes: **default → narrative → monitor**.
+
+The default mode is a refined structured log: rounds group into blocks (newest round on top, events reading chronologically inside), each header carries the result (`KOLESIE win · defused · 3-1`), and kills are annotated with the opening duel (`·opening`), multi-kills (`·3K`/`·ACE`), won clutches (`⤷ rendysky 1v2 clutch`), and an approximate map zone (`A site`, `mid`, `B approach`) derived from the kill's world coordinates.
+
+The narrative mode tells the same rounds as prose — `ex1st opened the round, killing amster with an M4A1-S (headshot) at A approach` … `KOLESIE won the round — bomb defused (3-1).` — while the scoreboard stays structured.
+
+The monitor mode re-labels everything as a build/SRE monitor — same numbers, different vocabulary (kills become arrowed events, zones become `sector A`/`core`, clutches become `solo-recover 1v2`).
 
 <p align="center"><img src="docs/csmatch-monitor.png" alt="monitor theme in narrow layout" width="640"></p>
 
-In the monitor theme the score column becomes `status`, maps become `clusters`, rounds become `iters`, kills render as arrowed events, and bomb plant / defuse become `[deploy]` / `[rollback]`. Player names and numbers stay readable. The screenshot above also shows the narrow stacked layout (list above, scrollable detail below) that kicks in automatically when the terminal is under ~100 columns wide.
+In the monitor mode the score column becomes `status`, maps become `clusters`, rounds become `iters`, kills render as arrowed events, and bomb plant / defuse become `[deploy]` / `[rollback]`. Player names and numbers stay readable. The screenshot above also shows the narrow stacked layout (list above, scrollable detail below) that kicks in automatically when the terminal is under ~100 columns wide.
 
 ## How the live scorebot works
 
@@ -89,7 +96,10 @@ src/csmatch/
   cli.py        click entry
   tui.py        Textual app
   scorebot.py   Playwright bridge → in-page Engine.IO client → live HLTV scorebot
-  vocab.py     label sets for the two themes
+  vocab.py     label sets for the display modes
+  analysis.py  live round analysis (opening / multi-kill / clutch)
+  narrate.py   natural-language event narration
+  locations.py approximate kill zones from world coordinates
   sources/
     base.py     MatchSource ABC
     bo3gg.py    bo3.gg JSON API
