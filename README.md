@@ -49,7 +49,11 @@ In the monitor theme the score column becomes `status`, maps become `clusters`, 
 
 ## How the live scorebot works
 
-HLTV streams real-time per-kill data over a Socket.IO endpoint that rejects every Python HTTP client (TLS fingerprint check) and silently drops subscribe events from anything that isn't a real browser. csmatch launches a Chromium pointed off-screen at `(-2400, -2400)`, lets HLTV's own JavaScript do the handshake, and reads the rendered DOM at 1Hz. On macOS the Chromium process is hidden from the Dock and Cmd-Tab via `osascript`, and focus is bounced back to whichever terminal app was frontmost so the launch doesn't steal your input.
+HLTV streams real-time per-kill data over a Socket.IO (Engine.IO v3) endpoint behind Cloudflare. csmatch launches a Chromium pointed off-screen at `(-2400, -2400)` and, *from inside the match page*, runs its own Engine.IO long-polling client against `scorebot-lb.hltv.org`. Running in the page context means the requests inherit the page's cookies / TLS / origin and clear Cloudflare like HLTV's own client does — and because it's a separate connection we fully control, we parse the raw `log` + `scoreboard` events directly rather than scraping the rendered DOM.
+
+This matters for accuracy: the visible kill-feed DOM is virtualised to ~15 rows and carries no event ids, so polling it drops bursts and de-dupes identical kills across rounds — the old "lost events" failure. The socket carries every kill with a stable `eventId`, so capture is lossless and realtime. Round transitions are derived from the authoritative scoreboard (so they survive reconnects), and the per-map series header + round clock come from a light read-only DOM read.
+
+On macOS the Chromium process is hidden from the Dock and Cmd-Tab via `osascript`, and focus is bounced back to whichever terminal app was frontmost so the launch doesn't steal your input.
 
 First run downloads Chromium (~200 MB).
 
@@ -84,7 +88,7 @@ src/csmatch/
   models.py     pydantic models (Match, Player, Score, …)
   cli.py        click entry
   tui.py        Textual app
-  scorebot.py   Playwright bridge → live HLTV scorebot DOM
+  scorebot.py   Playwright bridge → in-page Engine.IO client → live HLTV scorebot
   vocab.py     label sets for the two themes
   sources/
     base.py     MatchSource ABC
